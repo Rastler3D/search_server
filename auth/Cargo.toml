@@ -1,0 +1,20 @@
+[package]
+name = "auth"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+base64 = "0.21.7"
+enum-iterator = "1.5.0"
+hmac = "0.12.1"
+maplit = "1.0.2"
+shared_types = { path = "../shared_types" }
+rand = "0.8.5"
+roaring = { version = "0.10.2", features = ["serde"] }
+serde = { version = "1.0.195", features = ["derive"] }
+serde_json = { version = "1.0.111", features = ["preserve_order"] }
+sha2 = "0.10.8"
+thiserror = "1.0.56"
+time = { version = "0.3.31", features = ["serde-well-known", "formatting", "parsing", "macros"] }
+uuid = { version = "1.6.1", features = ["serde", "v4"] }

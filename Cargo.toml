@@ -1,0 +1,6 @@
+[workspace]
+members = ["search_engine", "analyzer", "query_lang", "index-scheduler", "shared_types", "auth", "search_server"]
+resolver = "2"
+
+[patch.crates-io]
+stable_deref_trait = { path = "analyzer/stable_deref_trait-1.2.0"  }
