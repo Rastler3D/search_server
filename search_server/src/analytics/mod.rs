@@ -30,29 +30,29 @@ pub type FacetSearchAggregator = mock_analytics::FacetSearchAggregator;
 #[cfg(feature = "analytics")]
 pub type SegmentAnalytics = segment_analytics::SegmentAnalytics;
 #[cfg(feature = "analytics")]
-pub type SearchAggregator = segment_analytics::SearchAggregator;
+pub type SearchAggregator = segment_analytics::SearchEvent;
 #[cfg(feature = "analytics")]
 pub type MultiSearchAggregator = segment_analytics::MultiSearchAggregator;
 #[cfg(feature = "analytics")]
 pub type FacetSearchAggregator = segment_analytics::FacetSearchAggregator;
 
-/// The Meilisearch config dir:
-/// `~/.config/Meilisearch` on *NIX or *BSD.
+/// The SearchServer config dir:
+/// `~/.config/SearchServer` on *NIX or *BSD.
 /// `~/Library/ApplicationSupport` on macOS.
 /// `%APPDATA` (= `C:\Users%USERNAME%\AppData\Roaming`) on windows.
-static MEILISEARCH_CONFIG_PATH: Lazy<Option<PathBuf>> =
-    Lazy::new(|| AppDirs::new(Some("Meilisearch"), false).map(|appdir| appdir.config_dir));
+static SEARCH_SERVER_CONFIG_PATH: Lazy<Option<PathBuf>> =
+    Lazy::new(|| AppDirs::new(Some("SearchServer"), false).map(|appdir| appdir.config_dir));
 
 fn config_user_id_path(db_path: &Path) -> Option<PathBuf> {
     db_path
         .canonicalize()
         .ok()
         .map(|path| path.join("instance-uid").display().to_string().replace('/', "-"))
-        .zip(MEILISEARCH_CONFIG_PATH.as_ref())
+        .zip(SEARCH_SERVER_CONFIG_PATH.as_ref())
         .map(|(filename, config_path)| config_path.join(filename.trim_start_matches('-')))
 }
 
-/// Look for the instance-uid in the `data.ms` or in `~/.config/Meilisearch/path-to-db-instance-uid`
+/// Look for the instance-uid in the `data.ms` or in `~/.config/SearchServer/path-to-db-instance-uid`
 fn find_user_id(db_path: &Path) -> Option<InstanceUid> {
     fs::read_to_string(db_path.join("instance-uid"))
         .ok()

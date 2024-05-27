@@ -1,6 +1,7 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::mem::take;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,16 +17,17 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use segment::message::{Identify, Track, User};
 use segment::{AutoBatcher, Batcher, HttpClient};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sysinfo::{Disks, System};
 use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use uuid::Uuid;
+use shared_types::index_uid::IndexUid;
 
 use super::{
-    config_user_id_path, DocumentDeletionKind, DocumentFetchKind, MEILISEARCH_CONFIG_PATH,
+    config_user_id_path, DocumentDeletionKind, DocumentFetchKind, SEARCH_SERVER_CONFIG_PATH,
 };
 use crate::analytics::Analytics;
 use crate::option::{
@@ -41,20 +43,20 @@ use crate::search::{
 };
 use crate::Opt;
 
-const ANALYTICS_HEADER: &str = "X-Meilisearch-Client";
+const ANALYTICS_HEADER: &str = "X-SearchSystem-Client";
 
-/// Write the instance-uid in the `data.ms` and in `~/.config/MeiliSearch/path-to-db-instance-uid`. Ignore the errors.
+/// Write the instance-uid in the `data.ms` and in `~/.config/SearchServer/path-to-db-instance-uid`. Ignore the errors.
 fn write_user_id(db_path: &Path, user_id: &InstanceUid) {
     let _ = fs::write(db_path.join("instance-uid"), user_id.to_string());
-    if let Some((meilisearch_config_path, user_id_path)) =
-        MEILISEARCH_CONFIG_PATH.as_ref().zip(config_user_id_path(db_path))
+    if let Some((search_server_config_path, user_id_path)) =
+        SEARCH_SERVER_CONFIG_PATH.as_ref().zip(config_user_id_path(db_path))
     {
-        let _ = fs::create_dir_all(meilisearch_config_path);
+        let _ = fs::create_dir_all(search_server_config_path);
         let _ = fs::write(user_id_path, user_id.to_string());
     }
 }
 
-const SEGMENT_API_KEY: &str = "P3FWhhEsJiEDCuEHpmcN9DHcK4hVfBvb";
+const SEGMENT_API_KEY: &str = "PDGylYKlzTCyw8Blh5QOjCep4h4O6Dl5";
 
 pub fn extract_user_agents(request: &HttpRequest) -> Vec<String> {
     request
@@ -71,8 +73,8 @@ pub fn extract_user_agents(request: &HttpRequest) -> Vec<String> {
 
 pub enum AnalyticsMsg {
     BatchMessage(Track),
-    AggregateGetSearch(SearchAggregator),
-    AggregatePostSearch(SearchAggregator),
+    AggregateGetSearch(SearchEvent),
+    AggregatePostSearch(SearchEvent),
     AggregatePostMultiSearch(MultiSearchAggregator),
     AggregatePostFacetSearch(FacetSearchAggregator),
     AggregateAddDocuments(DocumentsAggregator),
@@ -108,7 +110,7 @@ impl SegmentAnalytics {
         }
 
         let client =
-            HttpClient::new(client.unwrap(), "https://telemetry.meilisearch.com".to_string());
+            HttpClient::new(client.unwrap(), "https://api.segment.io".to_string());
         let user = User::UserId { user_id: instance_uid.to_string() };
         let mut batcher = AutoBatcher::new(client, Batcher::new(None), SEGMENT_API_KEY.to_string());
 
@@ -137,10 +139,10 @@ impl SegmentAnalytics {
             user: user.clone(),
             opt: opt.clone(),
             batcher,
-            post_search_aggregator: SearchAggregator::default(),
+            post_search_aggregator: Vec::new(),
             post_multi_search_aggregator: MultiSearchAggregator::default(),
             post_facet_search_aggregator: FacetSearchAggregator::default(),
-            get_search_aggregator: SearchAggregator::default(),
+            get_search_aggregator: Vec::new(),
             add_documents_aggregator: DocumentsAggregator::default(),
             delete_documents_aggregator: DocumentsDeletionAggregator::default(),
             update_documents_aggregator: DocumentsAggregator::default(),
@@ -173,11 +175,11 @@ impl super::Analytics for SegmentAnalytics {
         let _ = self.sender.try_send(AnalyticsMsg::BatchMessage(event));
     }
 
-    fn get_search(&self, aggregate: SearchAggregator) {
+    fn get_search(&self, aggregate: SearchEvent) {
         let _ = self.sender.try_send(AnalyticsMsg::AggregateGetSearch(aggregate));
     }
 
-    fn post_search(&self, aggregate: SearchAggregator) {
+    fn post_search(&self, aggregate: SearchEvent) {
         let _ = self.sender.try_send(AnalyticsMsg::AggregatePostSearch(aggregate));
     }
 
@@ -367,8 +369,8 @@ pub struct Segment {
     user: User,
     opt: Opt,
     batcher: AutoBatcher,
-    get_search_aggregator: SearchAggregator,
-    post_search_aggregator: SearchAggregator,
+    get_search_aggregator: Vec<SearchEvent>,
+    post_search_aggregator: Vec<SearchEvent>,
     post_multi_search_aggregator: MultiSearchAggregator,
     post_facet_search_aggregator: FacetSearchAggregator,
     add_documents_aggregator: DocumentsAggregator,
@@ -393,7 +395,7 @@ impl Segment {
                     "cores": sys.cpus().len(),
                     "ram_size": sys.total_memory(),
                     "disk_size": disks.iter().map(|disk| disk.total_space()).max(),
-                    "server_provider": std::env::var("MEILI_SERVER_PROVIDER").ok(),
+                    "server_provider": std::env::var("SEARCH_SERVER_PROVIDER").ok(),
             })
         });
         let number_of_documents =
@@ -416,21 +418,46 @@ impl Segment {
         index_scheduler: Arc<IndexScheduler>,
         auth_controller: Arc<AuthController>,
     ) {
-        const INTERVAL: Duration = Duration::from_secs(60 * 60); // one hour
+        const INTERVAL: Duration = Duration::from_secs(60); // one hour
                                                                  // The first batch must be sent after one hour.
         let mut interval =
             tokio::time::interval_at(tokio::time::Instant::now() + INTERVAL, INTERVAL);
+        const IDENTITY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+        let mut identity_interval =
+            tokio::time::interval_at(tokio::time::Instant::now(), IDENTITY_INTERVAL);
 
         loop {
             select! {
+                _ = identity_interval.tick() => {
+                    if let Ok(stats) =
+                        create_all_stats(index_scheduler.clone().into(), auth_controller.clone().into(), &AuthFilter::default())
+                    {
+                        // Replace the version number with the prototype name if any.
+                        let version = env!("CARGO_PKG_VERSION");
+
+                        let _ = self
+                            .batcher
+                            .push(Identify {
+                                context: Some(json!({
+                                    "app": {
+                                        "version": version.to_string(),
+                                    },
+                                })),
+                                user: self.user.clone(),
+                                traits: Self::compute_traits(&self.opt, stats),
+                                ..Default::default()
+                            })
+                            .await;
+                    }
+                },
                 _ = interval.tick() => {
-                    self.tick(index_scheduler.clone(), auth_controller.clone()).await;
+                    self.tick().await;
                 },
                 msg = self.inbox.recv() => {
                     match msg {
                         Some(AnalyticsMsg::BatchMessage(msg)) => drop(self.batcher.push(msg).await),
-                        Some(AnalyticsMsg::AggregateGetSearch(agreg)) => self.get_search_aggregator.aggregate(agreg),
-                        Some(AnalyticsMsg::AggregatePostSearch(agreg)) => self.post_search_aggregator.aggregate(agreg),
+                        Some(AnalyticsMsg::AggregateGetSearch(agreg)) => self.get_search_aggregator.push(agreg),
+                        Some(AnalyticsMsg::AggregatePostSearch(agreg)) => self.post_search_aggregator.push(agreg),
                         Some(AnalyticsMsg::AggregatePostMultiSearch(agreg)) => self.post_multi_search_aggregator.aggregate(agreg),
                         Some(AnalyticsMsg::AggregatePostFacetSearch(agreg)) => self.post_facet_search_aggregator.aggregate(agreg),
                         Some(AnalyticsMsg::AggregateAddDocuments(agreg)) => self.add_documents_aggregator.aggregate(agreg),
@@ -447,29 +474,7 @@ impl Segment {
 
     async fn tick(
         &mut self,
-        index_scheduler: Arc<IndexScheduler>,
-        auth_controller: Arc<AuthController>,
     ) {
-        if let Ok(stats) =
-            create_all_stats(index_scheduler.into(), auth_controller.into(), &AuthFilter::default())
-        {
-            // Replace the version number with the prototype name if any.
-            let version = env!("CARGO_PKG_VERSION");
-
-            let _ = self
-                .batcher
-                .push(Identify {
-                    context: Some(json!({
-                        "app": {
-                            "version": version.to_string(),
-                        },
-                    })),
-                    user: self.user.clone(),
-                    traits: Self::compute_traits(&self.opt, stats),
-                    ..Default::default()
-                })
-                .await;
-        }
 
         let Segment {
             inbox: _,
@@ -487,15 +492,19 @@ impl Segment {
             post_fetch_documents_aggregator,
         } = self;
 
-        if let Some(get_search) =
-            take(get_search_aggregator).into_event(user, "Documents Searched GET")
-        {
-            let _ = self.batcher.push(get_search).await;
+        for event in take(get_search_aggregator){
+            if let Some(get_search) =
+                event.into_event(user, "Documents Searched GET")
+            {
+                let _ = self.batcher.push(get_search).await;
+            }
         }
-        if let Some(post_search) =
-            take(post_search_aggregator).into_event(user, "Documents Searched POST")
-        {
-            let _ = self.batcher.push(post_search).await;
+        for event in take(post_search_aggregator) {
+            if let Some(post_search) =
+                event.into_event(user, "Documents Searched POST")
+            {
+                let _ = self.batcher.push(post_search).await;
+            }
         }
         if let Some(post_multi_search) = take(post_multi_search_aggregator)
             .into_event(user, "Documents Searched by Multi-Search POST")
@@ -536,79 +545,81 @@ impl Segment {
     }
 }
 
+#[derive(Default, Serialize, Deserialize)]
+pub enum SearchType{
+    #[default]
+    FullText,
+    Hybrid,
+    Vector
+}
+
 #[derive(Default)]
-pub struct SearchAggregator {
+pub struct SearchEvent {
     timestamp: Option<OffsetDateTime>,
 
     // context
-    user_agents: HashSet<String>,
-
-    // requests
-    total_received: usize,
-    total_succeeded: usize,
-    time_spent: BinaryHeap<usize>,
-
-    // sort
-    sort_with_geo_point: bool,
-    // every time a request has a filter, this field must be incremented by the number of terms it contains
-    sort_sum_of_criteria_terms: usize,
-    // every time a request has a filter, this field must be incremented by one
-    sort_total_number_of_criteria: usize,
+    user_agents: String,
+    user_address: Option<SocketAddr>,
+    is_succeeded: bool,
+    time_spent: usize,
 
     // every time a request has a filter, this field must be incremented by the number of terms it contains
-    filter_sum_of_criteria_terms: usize,
+    has_sort_criteria: bool,
     // every time a request has a filter, this field must be incremented by one
-    filter_total_number_of_criteria: usize,
-    used_syntax: HashMap<String, usize>,
+    number_of_sort_criteria: usize,
+
+    // every time a request has a filter, this field must be incremented by the number of terms it contains
+    has_filter_criteria: bool,
 
     // attributes_to_search_on
     // every time a search is done using attributes_to_search_on
-    attributes_to_search_on_total_number_of_uses: usize,
+    has_attributes_to_search_on: bool,
+    number_of_attributes_to_search_on: usize,
 
     // q
     // The maximum number of terms in a q request
-    max_terms_number: usize,
-
+    query: Option<String>,
+    terms_number: usize,
+    search_type: SearchType,
+    index: String,
     // vector
     // The maximum number of floats in a vector request
-    max_vector_size: usize,
+    vector_size: usize,
     // Whether the semantic ratio passed to a hybrid search equals the default ratio.
-    semantic_ratio: bool,
+    semantic_ratio: f32,
     // Whether a non-default embedder was specified
-    embedder: bool,
-    analyzer: bool,
+    embedder: Option<String>,
+    analyzer: Option<String>,
     hybrid: bool,
     show_query_graph: bool,
+    top_score: Option<f64>,
     // every time a search is done, we increment the counter linked to the used settings
-    matching_strategy: HashMap<String, usize>,
+    matching_strategy: MatchingStrategy,
 
     // pagination
-    max_limit: usize,
-    max_offset: usize,
+    limit: usize,
+    offset: usize,
     finite_pagination: usize,
 
     // formatting
-    max_attributes_to_retrieve: usize,
-    max_attributes_to_highlight: usize,
+    attributes_to_retrieve: usize,
+    attributes_to_highlight: usize,
     highlight_pre_tag: bool,
     highlight_post_tag: bool,
-    max_attributes_to_crop: usize,
-    crop_marker: bool,
     show_matches_position: bool,
-    crop_length: bool,
 
-    // facets
-    facets_sum_of_terms: usize,
-    facets_total_number_of_facets: usize,
 
     // scoring
     show_ranking_score: bool,
     show_ranking_score_details: bool,
+
+    // result
+    hits: usize,
 }
 
-impl SearchAggregator {
+impl SearchEvent {
     #[allow(clippy::field_reassign_with_default)]
-    pub fn from_query(query: &SearchQuery, request: &HttpRequest) -> Self {
+    pub fn from_query(query: &SearchQuery, index_uid: &IndexUid, request: &HttpRequest) -> Self {
         let SearchQuery {
             q,
             vector,
@@ -618,7 +629,7 @@ impl SearchAggregator {
             hits_per_page,
             attributes_to_retrieve: _,
             attributes_to_crop: _,
-            crop_length,
+            crop_length: _,
             attributes_to_highlight: _,
             show_query_graph,
             show_matches_position,
@@ -629,7 +640,7 @@ impl SearchAggregator {
             facets: _,
             highlight_pre_tag,
             highlight_post_tag,
-            crop_marker,
+            crop_marker: _,
             matching_strategy,
             attributes_to_search_on,
             hybrid,
@@ -638,336 +649,311 @@ impl SearchAggregator {
 
         let mut ret = Self::default();
         ret.timestamp = Some(OffsetDateTime::now_utc());
-
-        ret.total_received = 1;
+        ret.index = index_uid.to_string();
         ret.user_agents = extract_user_agents(request).into_iter().collect();
+        ret.user_address = request.peer_addr().clone();
 
         if let Some(ref sort) = sort {
-            ret.sort_total_number_of_criteria = 1;
-            ret.sort_with_geo_point = sort.iter().any(|s| s.contains("_geoPoint("));
-            ret.sort_sum_of_criteria_terms = sort.len();
+            ret.has_sort_criteria = true;
+            ret.number_of_sort_criteria = sort.len();
         }
 
         if let Some(ref filter) = filter {
-            static RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\$and | \$or"#).unwrap());
-            ret.filter_total_number_of_criteria = 1;
-
-            let syntax = match filter {
-                Value::String(_) => "string".to_string(),
-                Value::Array(values) => {
-                    if values.iter().map(|v| v.to_string()).any(|s| RE.is_match(&s)) {
-                        "mixed".to_string()
-                    } else {
-                        "array".to_string()
-                    }
-                }
-                _ => "none".to_string(),
-            };
-            // convert the string to a HashMap
-            ret.used_syntax.insert(syntax, 1);
-
-            let stringified_filters = filter.to_string();
-            ret.filter_sum_of_criteria_terms = RE.split(&stringified_filters).count();
+            ret.has_filter_criteria = true;
         }
 
         // attributes_to_search_on
         if attributes_to_search_on.is_some() {
-            ret.attributes_to_search_on_total_number_of_uses = 1;
+            ret.has_attributes_to_search_on = true;
         }
 
         if let Some(ref q) = q {
-            ret.max_terms_number = q.split_whitespace().count();
+            ret.query = Some(q.clone());
+            ret.terms_number = q.split_whitespace().count();
         }
 
         if let Some(ref vector) = vector {
-            ret.max_vector_size = vector.len();
+            ret.vector_size = vector.len();
+            ret.search_type = SearchType::Vector;
         }
 
         if query.is_finite_pagination() {
             let limit = hits_per_page.unwrap_or_else(DEFAULT_SEARCH_LIMIT);
-            ret.max_limit = limit;
-            ret.max_offset = page.unwrap_or(1).saturating_sub(1) * limit;
+            ret.limit = limit;
+            ret.offset = page.unwrap_or(1).saturating_sub(1) * limit;
             ret.finite_pagination = 1;
         } else {
-            ret.max_limit = *limit;
-            ret.max_offset = *offset;
+            ret.limit = *limit;
+            ret.offset = *offset;
             ret.finite_pagination = 0;
         }
 
-        ret.matching_strategy.insert(format!("{:?}", matching_strategy), 1);
+        ret.matching_strategy = *matching_strategy;
 
         ret.highlight_pre_tag = *highlight_pre_tag != DEFAULT_HIGHLIGHT_PRE_TAG();
         ret.highlight_post_tag = *highlight_post_tag != DEFAULT_HIGHLIGHT_POST_TAG();
-        ret.crop_marker = *crop_marker != DEFAULT_CROP_MARKER();
-        ret.crop_length = *crop_length != DEFAULT_CROP_LENGTH();
         ret.show_matches_position = *show_matches_position;
         ret.show_query_graph = *show_query_graph;
         ret.show_ranking_score = *show_ranking_score;
         ret.show_ranking_score_details = *show_ranking_score_details;
-        ret.embedder = analyzer.is_some();
+        ret.analyzer = analyzer.clone();
 
         if let Some(hybrid) = hybrid {
-            ret.semantic_ratio = hybrid.semantic_ratio != DEFAULT_SEMANTIC_RATIO();
-            ret.embedder = hybrid.embedder.is_some();
+            ret.semantic_ratio = *hybrid.semantic_ratio;
+            ret.embedder = hybrid.embedder.clone();
             ret.hybrid = true;
-        }
+            ret.search_type = if *hybrid.semantic_ratio > 0. && *hybrid.semantic_ratio < 1.{
+                SearchType::Hybrid
+            }  else if *hybrid.semantic_ratio == 1. {
+                SearchType::Vector
+            } else {
+                SearchType::FullText
+            };
+        };
 
         ret
     }
 
     pub fn succeed(&mut self, result: &SearchResult) {
         let SearchResult {
-            hits: _,
+            hits:_,
             query: _,
             processing_time_ms,
-            hits_info: _,
+            hits_info,
             semantic_hit_count: _,
             facet_distribution: _,
             facet_stats: _,
-            query_graph
+            query_graph: _
 
         } = result;
 
-        self.total_succeeded = self.total_succeeded.saturating_add(1);
-        self.time_spent.push(*processing_time_ms as usize);
+        self.is_succeeded = true;
+        self.hits = hits_info.total_hits();
+        self.top_score = hits_info.top_score();
+        self.time_spent = *processing_time_ms as usize;
     }
 
-    /// Aggregate one [SearchAggregator] into another.
-    pub fn aggregate(&mut self, mut other: Self) {
-        let Self {
-            timestamp,
-            user_agents,
-            total_received,
-            total_succeeded,
-            ref mut time_spent,
-            sort_with_geo_point,
-            sort_sum_of_criteria_terms,
-            sort_total_number_of_criteria,
-            filter_sum_of_criteria_terms,
-            filter_total_number_of_criteria,
-            used_syntax,
-            attributes_to_search_on_total_number_of_uses,
-            max_terms_number,
-            max_vector_size,
-            matching_strategy,
-            max_limit,
-            max_offset,
-            finite_pagination,
-            max_attributes_to_retrieve,
-            max_attributes_to_highlight,
-            highlight_pre_tag,
-            highlight_post_tag,
-            max_attributes_to_crop,
-            crop_marker,
-            show_matches_position,
-            crop_length,
-            facets_sum_of_terms,
-            facets_total_number_of_facets,
-            show_query_graph,
-            show_ranking_score,
-            show_ranking_score_details,
-            semantic_ratio,
-            embedder,
-            hybrid,
-            analyzer
-        } = other;
-
-        if self.timestamp.is_none() {
-            self.timestamp = timestamp;
-        }
-
-        // context
-        for user_agent in user_agents.into_iter() {
-            self.user_agents.insert(user_agent);
-        }
-
-        // request
-        self.total_received = self.total_received.saturating_add(total_received);
-        self.total_succeeded = self.total_succeeded.saturating_add(total_succeeded);
-        self.time_spent.append(time_spent);
-
-        // sort
-        self.sort_with_geo_point |= sort_with_geo_point;
-        self.sort_sum_of_criteria_terms =
-            self.sort_sum_of_criteria_terms.saturating_add(sort_sum_of_criteria_terms);
-        self.sort_total_number_of_criteria =
-            self.sort_total_number_of_criteria.saturating_add(sort_total_number_of_criteria);
-
-        // filter
-        self.filter_sum_of_criteria_terms =
-            self.filter_sum_of_criteria_terms.saturating_add(filter_sum_of_criteria_terms);
-        self.filter_total_number_of_criteria =
-            self.filter_total_number_of_criteria.saturating_add(filter_total_number_of_criteria);
-        for (key, value) in used_syntax.into_iter() {
-            let used_syntax = self.used_syntax.entry(key).or_insert(0);
-            *used_syntax = used_syntax.saturating_add(value);
-        }
-
-        // attributes_to_search_on
-        self.attributes_to_search_on_total_number_of_uses = self
-            .attributes_to_search_on_total_number_of_uses
-            .saturating_add(attributes_to_search_on_total_number_of_uses);
-
-        // q
-        self.analyzer |= analyzer;
-        self.show_query_graph |= show_query_graph;
-        self.max_terms_number = self.max_terms_number.max(max_terms_number);
-
-        // vector
-        self.max_vector_size = self.max_vector_size.max(max_vector_size);
-        self.semantic_ratio |= semantic_ratio;
-        self.hybrid |= hybrid;
-        self.embedder |= embedder;
-
-        // pagination
-        self.max_limit = self.max_limit.max(max_limit);
-        self.max_offset = self.max_offset.max(max_offset);
-        self.finite_pagination += finite_pagination;
-
-        // formatting
-        self.max_attributes_to_retrieve =
-            self.max_attributes_to_retrieve.max(max_attributes_to_retrieve);
-        self.max_attributes_to_highlight =
-            self.max_attributes_to_highlight.max(max_attributes_to_highlight);
-        self.highlight_pre_tag |= highlight_pre_tag;
-        self.highlight_post_tag |= highlight_post_tag;
-        self.max_attributes_to_crop = self.max_attributes_to_crop.max(max_attributes_to_crop);
-        self.crop_marker |= crop_marker;
-        self.show_matches_position |= show_matches_position;
-        self.crop_length |= crop_length;
-
-        // facets
-        self.facets_sum_of_terms = self.facets_sum_of_terms.saturating_add(facets_sum_of_terms);
-        self.facets_total_number_of_facets =
-            self.facets_total_number_of_facets.saturating_add(facets_total_number_of_facets);
-
-        // matching strategy
-        for (key, value) in matching_strategy.into_iter() {
-            let matching_strategy = self.matching_strategy.entry(key).or_insert(0);
-            *matching_strategy = matching_strategy.saturating_add(value);
-        }
-
-        // scoring
-        self.show_ranking_score |= show_ranking_score;
-        self.show_ranking_score_details |= show_ranking_score_details;
-    }
+    // /// Aggregate one [SearchEvent] into another.
+    // pub fn aggregate(&mut self, mut other: Self) {
+    //     let Self {
+    //         timestamp,
+    //         user_agents,
+    //         total_received,
+    //         total_succeeded,
+    //         ref mut time_spent,
+    //         sort_with_geo_point,
+    //         sort_sum_of_criteria_terms,
+    //         sort_total_number_of_criteria,
+    //         filter_sum_of_criteria_terms,
+    //         filter_total_number_of_criteria,
+    //         used_syntax,
+    //         attributes_to_search_on_total_number_of_uses,
+    //         max_terms_number,
+    //         max_vector_size,
+    //         matching_strategy,
+    //         max_limit,
+    //         max_offset,
+    //         finite_pagination,
+    //         max_attributes_to_retrieve,
+    //         max_attributes_to_highlight,
+    //         highlight_pre_tag,
+    //         highlight_post_tag,
+    //         max_attributes_to_crop,
+    //         crop_marker,
+    //         show_matches_position,
+    //         crop_length,
+    //         facets_sum_of_terms,
+    //         facets_total_number_of_facets,
+    //         show_query_graph,
+    //         show_ranking_score,
+    //         show_ranking_score_details,
+    //         semantic_ratio,
+    //         embedder,
+    //         hybrid,
+    //         analyzer
+    //     } = other;
+    //
+    //     if self.timestamp.is_none() {
+    //         self.timestamp = timestamp;
+    //     }
+    //
+    //     // context
+    //     for user_agent in user_agents.into_iter() {
+    //         self.user_agents.insert(user_agent);
+    //     }
+    //
+    //     // request
+    //     self.total_received = self.total_received.saturating_add(total_received);
+    //     self.total_succeeded = self.total_succeeded.saturating_add(total_succeeded);
+    //     self.time_spent.append(time_spent);
+    //
+    //     // sort
+    //     self.sort_with_geo_point |= sort_with_geo_point;
+    //     self.sort_sum_of_criteria_terms =
+    //         self.sort_sum_of_criteria_terms.saturating_add(sort_sum_of_criteria_terms);
+    //     self.sort_total_number_of_criteria =
+    //         self.sort_total_number_of_criteria.saturating_add(sort_total_number_of_criteria);
+    //
+    //     // filter
+    //     self.filter_sum_of_criteria_terms =
+    //         self.filter_sum_of_criteria_terms.saturating_add(filter_sum_of_criteria_terms);
+    //     self.filter_total_number_of_criteria =
+    //         self.filter_total_number_of_criteria.saturating_add(filter_total_number_of_criteria);
+    //     for (key, value) in used_syntax.into_iter() {
+    //         let used_syntax = self.used_syntax.entry(key).or_insert(0);
+    //         *used_syntax = used_syntax.saturating_add(value);
+    //     }
+    //
+    //     // attributes_to_search_on
+    //     self.attributes_to_search_on_total_number_of_uses = self
+    //         .attributes_to_search_on_total_number_of_uses
+    //         .saturating_add(attributes_to_search_on_total_number_of_uses);
+    //
+    //     // q
+    //     self.analyzer |= analyzer;
+    //     self.show_query_graph |= show_query_graph;
+    //     self.max_terms_number = self.max_terms_number.max(max_terms_number);
+    //
+    //     // vector
+    //     self.max_vector_size = self.max_vector_size.max(max_vector_size);
+    //     self.semantic_ratio |= semantic_ratio;
+    //     self.hybrid |= hybrid;
+    //     self.embedder |= embedder;
+    //
+    //     // pagination
+    //     self.max_limit = self.max_limit.max(max_limit);
+    //     self.max_offset = self.max_offset.max(max_offset);
+    //     self.finite_pagination += finite_pagination;
+    //
+    //     // formatting
+    //     self.max_attributes_to_retrieve =
+    //         self.max_attributes_to_retrieve.max(max_attributes_to_retrieve);
+    //     self.max_attributes_to_highlight =
+    //         self.max_attributes_to_highlight.max(max_attributes_to_highlight);
+    //     self.highlight_pre_tag |= highlight_pre_tag;
+    //     self.highlight_post_tag |= highlight_post_tag;
+    //     self.max_attributes_to_crop = self.max_attributes_to_crop.max(max_attributes_to_crop);
+    //     self.crop_marker |= crop_marker;
+    //     self.show_matches_position |= show_matches_position;
+    //     self.crop_length |= crop_length;
+    //
+    //     // facets
+    //     self.facets_sum_of_terms = self.facets_sum_of_terms.saturating_add(facets_sum_of_terms);
+    //     self.facets_total_number_of_facets =
+    //         self.facets_total_number_of_facets.saturating_add(facets_total_number_of_facets);
+    //
+    //     // matching strategy
+    //     for (key, value) in matching_strategy.into_iter() {
+    //         let matching_strategy = self.matching_strategy.entry(key).or_insert(0);
+    //         *matching_strategy = matching_strategy.saturating_add(value);
+    //     }
+    //
+    //     // scoring
+    //     self.show_ranking_score |= show_ranking_score;
+    //     self.show_ranking_score_details |= show_ranking_score_details;
+    // }
 
     pub fn into_event(self, user: &User, event_name: &str) -> Option<Track> {
         let Self {
             timestamp,
             user_agents,
-            total_received,
-            total_succeeded,
+            user_address, is_succeeded,
             time_spent,
-            sort_with_geo_point,
-            sort_sum_of_criteria_terms,
-            sort_total_number_of_criteria,
-            filter_sum_of_criteria_terms,
-            filter_total_number_of_criteria,
-            used_syntax,
-            attributes_to_search_on_total_number_of_uses,
-            max_terms_number,
-            max_vector_size,
-            matching_strategy,
-            max_limit,
-            max_offset,
-            finite_pagination,
-            max_attributes_to_retrieve,
-            max_attributes_to_highlight,
-            highlight_pre_tag,
-            highlight_post_tag,
-            max_attributes_to_crop,
-            crop_marker,
-            show_matches_position,
-            crop_length,
-            facets_sum_of_terms,
-            facets_total_number_of_facets,
-            show_ranking_score,
-            show_ranking_score_details,
+            has_sort_criteria,
+            number_of_sort_criteria,
+            has_filter_criteria,
+            has_attributes_to_search_on,
+            number_of_attributes_to_search_on,
+            query,
+            terms_number,
+            search_type,
+            index,
+            vector_size,
             semantic_ratio,
             embedder,
-            hybrid,
             analyzer,
-            show_query_graph
+            hybrid,
+            show_query_graph,
+            top_score,
+            matching_strategy,
+            limit,
+            offset,
+            finite_pagination,
+            attributes_to_retrieve,
+            attributes_to_highlight,
+            highlight_pre_tag,
+            highlight_post_tag,
+            show_matches_position,
+            show_ranking_score,
+            show_ranking_score_details,
+            hits
         } = self;
 
-        if total_received == 0 {
-            None
-        } else {
-            // we get all the values in a sorted manner
-            let time_spent = time_spent.into_sorted_vec();
-            // the index of the 99th percentage of value
-            let percentile_99th = time_spent.len() * 99 / 100;
-            // We are only interested by the slowest value of the 99th fastest results
-            let time_spent = time_spent.get(percentile_99th);
+        let user_ip = user_address.map(|x| x.ip());
 
-            let properties = json!({
-                "user-agent": user_agents,
-                "requests": {
-                    "99th_response_time": time_spent.map(|t| format!("{:.2}", t)),
-                    "total_succeeded": total_succeeded,
-                    "total_failed": total_received.saturating_sub(total_succeeded), // just to be sure we never panics
-                    "total_received": total_received,
-                },
-                "sort": {
-                    "with_geoPoint": sort_with_geo_point,
-                    "avg_criteria_number": format!("{:.2}", sort_sum_of_criteria_terms as f64 / sort_total_number_of_criteria as f64),
-                },
-                "filter": {
-                   "avg_criteria_number": format!("{:.2}", filter_sum_of_criteria_terms as f64 / filter_total_number_of_criteria as f64),
-                   "most_used_syntax": used_syntax.iter().max_by_key(|(_, v)| *v).map(|(k, _)| json!(k)).unwrap_or_else(|| json!(null)),
-                },
-                "attributes_to_search_on": {
-                   "total_number_of_uses": attributes_to_search_on_total_number_of_uses,
-                },
-                "q": {
-                    "show_query_graph": show_query_graph,
-                    "analyzer": analyzer,
-                    "max_terms_number": max_terms_number,
-                },
-                "vector": {
-                    "max_vector_size": max_vector_size,
-                },
-                "hybrid": {
-                    "enabled": hybrid,
-                    "semantic_ratio": semantic_ratio,
-                    "embedder": embedder,
-                },
-                "pagination": {
-                   "max_limit": max_limit,
-                   "max_offset": max_offset,
-                   "most_used_navigation": if finite_pagination > (total_received / 2) { "exhaustive" } else { "estimated" },
-                },
-                "formatting": {
-                    "max_attributes_to_retrieve": max_attributes_to_retrieve,
-                    "max_attributes_to_highlight": max_attributes_to_highlight,
-                    "highlight_pre_tag": highlight_pre_tag,
-                    "highlight_post_tag": highlight_post_tag,
-                    "max_attributes_to_crop": max_attributes_to_crop,
-                    "crop_marker": crop_marker,
-                    "show_matches_position": show_matches_position,
-                    "crop_length": crop_length,
-                },
-                "facets": {
-                    "avg_facets_number": format!("{:.2}", facets_sum_of_terms as f64 / facets_total_number_of_facets as f64),
-                },
-                "matching_strategy": {
-                    "most_used_strategy": matching_strategy.iter().max_by_key(|(_, v)| *v).map(|(k, _)| json!(k)).unwrap_or_else(|| json!(null)),
-                },
-                "scoring": {
-                    "show_ranking_score": show_ranking_score,
-                    "show_ranking_score_details": show_ranking_score_details,
-                },
-            });
+        let properties = json!({
+            "user-agent": user_agents,
+            "requests": {
+                "user_ip": user_ip,
+                "response_time": time_spent,
+                "is_succeeded": is_succeeded,
+                "is_failed": !is_succeeded,
+            },
+            "sort": {
+                "has_sort_criteria": has_sort_criteria,
+                "number_of_sort_criteria": number_of_sort_criteria,
+            },
+            "filter": {
+                "has_filter_criteria": has_filter_criteria,
+            },
+            "attributes_to_search_on": {
+                "number_of_attributes_to_search_on": number_of_attributes_to_search_on,
+            },
+            "q": {
+                "query": query,
+                "show_query_graph": show_query_graph,
+                "analyzer": analyzer,
+                "terms_number": terms_number,
+            },
+            "vector": {
+                "vector_size": vector_size,
+            },
+            "hybrid": {
+                "enabled": hybrid,
+                "semantic_ratio": semantic_ratio,
+                "embedder": embedder,
+            },
+            "pagination": {
+               "limit": limit,
+               "offset": offset,
+            },
+            "formatting": {
+                "attributes_to_retrieve": attributes_to_retrieve,
+                "attributes_to_highlight": attributes_to_highlight,
+                "highlight_pre_tag": highlight_pre_tag,
+                "highlight_post_tag": highlight_post_tag,
+                "show_matches_position": show_matches_position,
+            },
+            "search": {
+                "index": index,
+                "search_type": search_type,
+                "hits": hits,
+                "top_score": top_score,
+                "matching_strategy": matching_strategy,
+            },
+            "scoring": {
+                "show_ranking_score": show_ranking_score,
+                "show_ranking_score_details": show_ranking_score_details,
+            },
+        });
 
-            Some(Track {
-                timestamp,
-                user: user.clone(),
-                event: event_name.to_string(),
-                properties,
-                ..Default::default()
-            })
-        }
+        Some(Track {
+            timestamp,
+            user: user.clone(),
+            event: event_name.to_string(),
+            properties,
+            ..Default::default()
+        })
     }
 }
 

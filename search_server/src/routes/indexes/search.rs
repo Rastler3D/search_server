@@ -205,7 +205,7 @@ pub async fn search_with_url_query(
         add_search_rules(&mut query, search_rules);
     }
 
-    let mut aggregate = SearchAggregator::from_query(&query, &req);
+    let mut aggregate = SearchAggregator::from_query(&query, &index_uid, &req);
 
     let index = index_scheduler.index(&index_uid)?;
     let features = index_scheduler.features();
@@ -244,7 +244,7 @@ pub async fn search_with_post(
         add_search_rules(&mut query, search_rules);
     }
 
-    let mut aggregate = SearchAggregator::from_query(&query, &req);
+    let mut aggregate = SearchAggregator::from_query(&query, &index_uid, &req);
 
     let index = index_scheduler.index(&index_uid)?;
 

@@ -25,7 +25,7 @@ use search_engine::{
     SortError, TermsMatchingStrategy, DEFAULT_VALUES_PER_FACET,
 };
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::error::SearchSystemHttpError;
@@ -437,7 +437,7 @@ impl SearchQueryWithIndex {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserr)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserr, Serialize, Deserialize)]
 #[deserr(rename_all = camelCase)]
 pub enum MatchingStrategy {
     /// Remove query words from last to first
@@ -558,13 +558,31 @@ pub struct SearchResultWithIndex {
     pub result: SearchResult,
 }
 
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum HitsInfo {
     #[serde(rename_all = "camelCase")]
-    Pagination { hits_per_page: usize, page: usize, total_pages: usize, total_hits: usize },
+    Pagination { hits_per_page: usize, page: usize, total_pages: usize, total_hits: usize, top_score: Option<f64> },
     #[serde(rename_all = "camelCase")]
-    OffsetLimit { limit: usize, offset: usize, total_hits: usize },
+    OffsetLimit { limit: usize, offset: usize, total_hits: usize, top_score: Option<f64> },
+}
+
+impl HitsInfo {
+    pub fn total_hits(&self) -> usize{
+        match self {
+            HitsInfo::Pagination { total_hits, .. } | HitsInfo::OffsetLimit { total_hits, .. } => {
+                *total_hits
+            }
+        }
+    }
+
+    pub fn top_score(&self) -> Option<f64>{
+        match self {
+            HitsInfo::Pagination { top_score, .. } | HitsInfo::OffsetLimit { top_score, .. } => {
+                top_score.clone()
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -779,7 +797,7 @@ pub fn perform_search(
 
     let mut documents = Vec::new();
     let documents_iter = index.documents(&rtxn, documents_ids)?;
-
+    let top_score = document_scores.first().map(|score| ScoreDetails::global_score(score.iter()));
     for ((_id, obkv), score) in documents_iter.into_iter().zip(document_scores.into_iter()) {
         // First generate a document with all the displayed fields
         let displayed_document = make_document(&fields_ids_map, obkv)?;
@@ -822,15 +840,15 @@ pub fn perform_search(
         let total_pages = (number_of_hits + hits_per_page.saturating_sub(1))
             .checked_div(hits_per_page)
             .unwrap_or(0);
-
         HitsInfo::Pagination {
             hits_per_page,
             page: query.page.unwrap_or(1),
             total_pages,
             total_hits: number_of_hits,
+            top_score
         }
     } else {
-        HitsInfo::OffsetLimit { limit: query.limit, offset, total_hits: number_of_hits }
+        HitsInfo::OffsetLimit { limit: query.limit, offset, total_hits: number_of_hits, top_score}
     };
 
     let (facet_distribution, facet_stats) = match query.facets {
