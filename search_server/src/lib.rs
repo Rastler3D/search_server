@@ -10,6 +10,8 @@ pub mod option;
 pub mod routes;
 pub mod search;
 pub mod search_queue;
+pub mod raft;
+pub mod database;
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
